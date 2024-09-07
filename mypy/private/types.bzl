@@ -47,11 +47,11 @@ def _generate_impl(rctx):
             continue
 
         if "~=" in line:
-            req, _ = line.split("~=")
+            req = line.split("~=")[0]
         elif "==" in line:
-            req, _ = line.split("==")
+            req = line.split("==")[0]
         elif "<=" in line:
-            req, _ = line.split("<=")
+            req = line.split("<=")[0]
         else:
             continue
 
