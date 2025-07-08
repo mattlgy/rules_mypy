@@ -7,8 +7,9 @@ directories (the results of other mypy builds), the underlying action first atte
 directories.
 """
 
-load("@python_versions//3.12:defs.bzl", py312_binary = "py_binary")
 load("@rules_mypy_pip//:requirements.bzl", "requirement")
+load("@rules_python//python:py_binary.bzl", "py_binary")
+load("@rules_python//python:py_info.bzl", RulesPythonPyInfo = "PyInfo")
 load(":py_type_library.bzl", "PyTypeLibraryInfo")
 
 MypyCacheInfo = provider(
@@ -19,8 +20,24 @@ MypyCacheInfo = provider(
 )
 
 def _extract_import_dir(import_):
-    # _main/path/to/package -> path/to/package
-    return import_.split("/", 1)[-1]
+    # Remove first parent from the directory
+    if "/" in import_:
+        # "_main/path/to/package" -> "path/to/package"
+        return import_.split("/", 1)[-1]
+    else:
+        # "_main" -> ""
+        return ""
+
+def _imports(target):
+    if RulesPythonPyInfo in target:
+        return target[RulesPythonPyInfo].imports.to_list()
+    elif PyInfo in target:
+        return target[PyInfo].imports.to_list()
+    else:
+        return []
+
+def _extract_imports(target):
+    return [_extract_import_dir(i) for i in _imports(target)]
 
 def _opt_out(opt_out_tags, rule_tags):
     "Returns true iff at least one opt_out_tag appears in rule_tags."
@@ -49,8 +66,7 @@ def _mypy_impl(target, ctx):
     if target.label.workspace_root != "":
         return []
 
-    # only instrument py_* targets
-    if ctx.rule.kind not in ["py_binary", "py_library", "py_test"]:
+    if RulesPythonPyInfo not in target and PyInfo not in target:
         return []
 
     # disable if a target is tagged with at least one suppression tag
@@ -61,9 +77,13 @@ def _mypy_impl(target, ctx):
     if not _opt_in(ctx.attr._opt_in_tags, ctx.rule.attr.tags):
         return []
 
+    # ignore rules that don't carry source files like py_proto_library
+    if not hasattr(ctx.rule.files, "srcs"):
+        return []
+
     # we need to help mypy map the location of external deps by setting
     # MYPYPATH to include the site-packages directories.
-    external_deps = []
+    external_deps = {}
 
     # we need to help mypy map the location of first party deps with custom
     # 'imports' by setting MYPYPATH.
@@ -79,34 +99,37 @@ def _mypy_impl(target, ctx):
     depsets = []
 
     type_mapping = dict(zip([k.label for k in ctx.attr._types_keys], ctx.attr._types_values))
+    dep_with_stubs = [_.label.workspace_root + "/site-packages" for _ in ctx.attr._types_keys]
     additional_types = [
         type_mapping[dep.label]
         for dep in ctx.rule.attr.deps
         if dep.label in type_mapping
     ]
 
-    if PyInfo in target:
-        for import_ in target[PyInfo].imports.to_list():
-            imports_dirs[_extract_import_dir(import_)] = 1
+    for import_ in _extract_imports(target):
+        imports_dirs[import_] = 1
 
+    pyi_files = []
+    pyi_dirs = {}
     for dep in (ctx.rule.attr.deps + additional_types):
+        if RulesPythonPyInfo in dep and hasattr(dep[RulesPythonPyInfo], "direct_pyi_files"):
+            pyi_files.extend(dep[RulesPythonPyInfo].direct_pyi_files.to_list())
+            pyi_dirs |= {"%s/%s" % (ctx.bin_dir.path, imp): None for imp in _extract_imports(dep) if imp != "site-packages" and imp != "_main"}
         depsets.append(dep.default_runfiles.files)
-
         if PyTypeLibraryInfo in dep:
             types.append(dep[PyTypeLibraryInfo].directory.path + "/site-packages")
+        elif dep.label in type_mapping:
+            continue
         elif dep.label.workspace_root.startswith("external/"):
             # TODO: do we need this, still?
-            external_deps.append(dep.label.workspace_root + "/site-packages")
-
-            external_deps.extend([
-                "external/{}".format(x)
-                for x in dep[PyInfo].imports.to_list()
-                if "mypy_extensions" not in x and
-                   "typing_extensions" not in x
-            ])
-        elif PyInfo in dep and dep.label.workspace_name == "":
-            for import_ in dep[PyInfo].imports.to_list():
-                imports_dirs[_extract_import_dir(import_)] = 1
+            external_deps[dep.label.workspace_root + "/site-packages"] = 1
+            for imp in [_ for _ in _imports(dep) if "mypy_extensions" not in _ and "typing_extensions" not in _]:
+                path = "external/{}".format(imp)
+                if path not in dep_with_stubs:
+                    external_deps[path] = 1
+        elif dep.label.workspace_name == "":
+            for import_ in _extract_imports(dep):
+                imports_dirs[import_] = 1
 
         if MypyCacheInfo in dep:
             upstream_caches.append(dep[MypyCacheInfo].directory)
@@ -119,37 +142,44 @@ def _mypy_impl(target, ctx):
         # and as a way to skip iterating over depset contents to find generated
         # file roots?
 
-    unique_imports_dirs = imports_dirs.keys()
-    unique_generated_dirs = generated_dirs.keys()
     generated_imports_dirs = []
-    for generated_dir in unique_generated_dirs:
-        for import_ in unique_imports_dirs:
+    for generated_dir in generated_dirs.keys():
+        for import_ in imports_dirs.keys():
             generated_imports_dirs.append("{}/{}".format(generated_dir, import_))
 
-    # types need to appear first in the mypy path since the module directories
-    # are the same and mypy resolves the first ones, first.
-    mypy_path = ":".join(types + external_deps + unique_imports_dirs + unique_generated_dirs + generated_imports_dirs)
+    mypy_path = ":".join(
+        # normally, mypy looks in the current directory last, but we explicitly want
+        # to check the current directory first, to avoid issues where mypy finds the
+        # output bin_dir from `generated_dirs` first
+        # https://github.com/theoremlp/rules_mypy/issues/88
+        ["."] +
+        # types need to appear first in the mypy path since the module directories
+        # are the same and mypy resolves the first ones, first.
+        sorted(types) +
+        sorted(external_deps) +
+        sorted(imports_dirs) +
+        sorted(generated_dirs) +
+        sorted(generated_imports_dirs) +
+        sorted(pyi_dirs),
+    )
 
     output_file = ctx.actions.declare_file(ctx.rule.attr.name + ".mypy_stdout")
 
     args = ctx.actions.args()
     args.add("--output", output_file)
 
+    result_info = [OutputGroupInfo(mypy = depset([output_file]))]
     if ctx.attr.cache:
         cache_directory = ctx.actions.declare_directory(ctx.rule.attr.name + ".mypy_cache")
         args.add("--cache-dir", cache_directory.path)
 
         outputs = [output_file, cache_directory]
-        result_info = [
-            MypyCacheInfo(directory = cache_directory),
-            OutputGroupInfo(mypy = depset(outputs)),
-        ]
+        result_info.append(MypyCacheInfo(directory = cache_directory))
     else:
         outputs = [output_file]
-        result_info = [OutputGroupInfo(mypy = depset(outputs))]
 
     args.add_all([c.path for c in upstream_caches], before_each = "--upstream-cache")
-    args.add_all(ctx.rule.files.srcs)
+    args.add_all([s for s in ctx.rule.files.srcs if "/_virtual_imports/" not in s.short_path])
 
     if hasattr(ctx.attr, "_mypy_ini"):
         args.add("--mypy-ini", ctx.file._mypy_ini.path)
@@ -157,24 +187,26 @@ def _mypy_impl(target, ctx):
     else:
         config_files = []
 
+    extra_env = {}
+    if ctx.attr.color:
+        # force color on
+        extra_env["MYPY_FORCE_COLOR"] = "1"
+
+        # force color on only works if TERM is set to something that supports color
+        extra_env["TERM"] = "xterm-256color"
+
     py_type_files = [x for x in ctx.rule.files.data if x.basename == "py.typed" or x.extension == "pyi"]
     ctx.actions.run(
         mnemonic = "mypy",
         progress_message = "mypy %{label}",
         inputs = depset(
-            direct = ctx.rule.files.srcs + py_type_files + upstream_caches + config_files,
+            direct = ctx.rule.files.srcs + py_type_files + pyi_files + upstream_caches + config_files,
             transitive = depsets,
         ),
         outputs = outputs,
         executable = ctx.executable._mypy_cli,
         arguments = [args],
-        env = {
-            "MYPYPATH": mypy_path,
-            # force color on
-            "MYPY_FORCE_COLOR": "1",
-            # force color on only works if TERM is set to something that supports color
-            "TERM": "xterm-256color",
-        } | ctx.configuration.default_shell_env,
+        env = {"MYPYPATH": mypy_path} | ctx.configuration.default_shell_env | extra_env,
     )
 
     return result_info
@@ -184,6 +216,7 @@ def mypy(
         mypy_ini = None,
         types = None,
         cache = True,
+        color = True,
         suppression_tags = None,
         opt_in_tags = None):
     """
@@ -203,6 +236,7 @@ def mypy(
                     Use the types extension to create this map for a requirements.in
                     or requirements.txt file.
         cache:      (optional, default True) propagate the mypy cache
+        color:      (optional, default True) use color in mypy output
         suppression_tags: (optional, default ["no-mypy"]) tags that suppress running
                     mypy on a particular target.
         opt_in_tags: (optional, default []) tags that must be present for mypy to run
@@ -239,10 +273,11 @@ def mypy(
             "_suppression_tags": attr.string_list(default = suppression_tags or ["no-mypy"]),
             "_opt_in_tags": attr.string_list(default = opt_in_tags or []),
             "cache": attr.bool(default = cache),
+            "color": attr.bool(default = color),
         } | additional_attrs,
     )
 
-def mypy_cli(name, deps = None, mypy_requirement = None, py_binary = py312_binary, tags = None):
+def mypy_cli(name, deps = None, mypy_requirement = None, python_version = "3.12", tags = None):
     """
     Produce a custom mypy executable for use with the mypy build rule.
 
@@ -252,7 +287,8 @@ def mypy_cli(name, deps = None, mypy_requirement = None, py_binary = py312_binar
               (note: must match the Python version of py_binary)
         mypy_requirement: (optional) a replacement mypy requirement
               (note: must match the Python version of py_binary)
-        py_binary: (optional) the py_binary rule to use when constructing this target
+        python_version: (optional) the python_version to use for this target.
+              Pass None to use the default
               (defaults to a rules_mypy specified version, currently Python 3.12)
         tags: (optional) tags to include in the binary target
     """
@@ -262,9 +298,10 @@ def mypy_cli(name, deps = None, mypy_requirement = None, py_binary = py312_binar
 
     py_binary(
         name = name,
-        srcs = ["@rules_mypy//mypy/private:mypy.py"],
-        main = "@rules_mypy//mypy/private:mypy.py",
+        srcs = ["@rules_mypy//mypy/private:mypy_runner.py"],
+        main = "@rules_mypy//mypy/private:mypy_runner.py",
         visibility = ["//visibility:public"],
         deps = [mypy_requirement] + deps,
+        python_version = python_version,
         tags = tags,
     )
